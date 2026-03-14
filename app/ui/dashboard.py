@@ -1,11 +1,15 @@
-"""Main dashboard — 4 tabs: Telemetry / Controls / Mission / Log."""
+"""Main dashboard — 5 tabs: Telemetry / Map / Controls / Mission / Log + Alerts."""
 from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 from app.mavlink_handler import MAVLinkHandler, TelemetryFrame
 from app.simulator       import TelemetrySimulator
+from app.telemetry       import TelemetryHistory
+from app.logger          import FlightLogger
 from app.ui.controls     import ControlsPanel
 from app.ui.mission      import MissionPanel
+from app.ui.map_view     import MapView
+from app.ui.alerts       import AlertsPanel
 from app.ui.log_panel    import LogPanel
 
 BG      = "#0f0f11"
@@ -39,11 +43,18 @@ class TelemetryCard(tk.Frame):
 class DashboardApp(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
-        self._handler: MAVLinkHandler | None     = None
-        self._sim:     TelemetrySimulator | None  = None
+        self._handler:  MAVLinkHandler    | None = None
+        self._sim:      TelemetrySimulator | None = None
+        self._history   = TelemetryHistory()
+        self._logger    = FlightLogger()
+        self._was_armed = False
         self._build_ui()
 
-    def _build_ui(self):
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
         # ---- top bar ----
         bar = tk.Frame(self, bg=SURFACE, height=52)
         bar.pack(fill=tk.X)
@@ -51,11 +62,16 @@ class DashboardApp(tk.Frame):
         tk.Label(bar, text="\U0001f7e9  DronePad", bg=SURFACE, fg=TEXT,
                  font=("Helvetica", 14, "bold")).pack(side=tk.LEFT, padx=16)
         self._status_label = tk.Label(bar, text="\u25cf  Disconnected",
-                                       bg=SURFACE, fg=DANGER, font=("Helvetica", 10, "bold"))
+                                       bg=SURFACE, fg=DANGER,
+                                       font=("Helvetica", 10, "bold"))
         self._status_label.pack(side=tk.RIGHT, padx=16)
         self._armed_label = tk.Label(bar, text="DISARMED",
-                                      bg=SURFACE, fg=SUCCESS, font=("Helvetica", 10, "bold"))
+                                      bg=SURFACE, fg=SUCCESS,
+                                      font=("Helvetica", 10, "bold"))
         self._armed_label.pack(side=tk.RIGHT, padx=8)
+        self._log_indicator = tk.Label(bar, text="", bg=SURFACE, fg=DANGER,
+                                        font=("Helvetica", 9, "bold"))
+        self._log_indicator.pack(side=tk.RIGHT, padx=8)
 
         # ---- connection bar ----
         row = tk.Frame(self, bg="#101012")
@@ -67,11 +83,14 @@ class DashboardApp(tk.Frame):
         self._conn_entry.insert(0, "udp:127.0.0.1:14550")
         self._conn_entry.pack(side=tk.LEFT, padx=8, ipady=4)
         tk.Button(row, text="Connect", bg=PRIMARY, fg=TEXT, relief=tk.FLAT,
-                  font=("Helvetica", 9, "bold"), padx=10, cursor="hand2",
-                  command=self._connect).pack(side=tk.LEFT)
+                   font=("Helvetica", 9, "bold"), padx=10, cursor="hand2",
+                   command=self._connect).pack(side=tk.LEFT)
         tk.Button(row, text="Simulate", bg="#27272a", fg=TEXT, relief=tk.FLAT,
-                  font=("Helvetica", 9, "bold"), padx=10, cursor="hand2",
-                  command=self._start_sim).pack(side=tk.LEFT, padx=6)
+                   font=("Helvetica", 9, "bold"), padx=10, cursor="hand2",
+                   command=self._start_sim).pack(side=tk.LEFT, padx=6)
+        tk.Button(row, text="Disconnect", bg="#27272a", fg=MUTED, relief=tk.FLAT,
+                   font=("Helvetica", 9, "bold"), padx=10, cursor="hand2",
+                   command=self._disconnect).pack(side=tk.LEFT, padx=2)
 
         # ---- tabs ----
         style = ttk.Style()
@@ -86,37 +105,49 @@ class DashboardApp(tk.Frame):
         nb = ttk.Notebook(self, style="DP.TNotebook")
         nb.pack(fill=tk.BOTH, expand=True)
 
-        # Tab 1 Telemetry
+        # Tab 1 — Telemetry
         t1 = tk.Frame(nb, bg=BG)
         nb.add(t1, text="  Telemetry  ")
         self._build_telemetry(t1)
 
-        # Tab 2 Controls
+        # Tab 2 — Map
         t2 = tk.Frame(nb, bg=BG)
-        nb.add(t2, text="  Controls  ")
+        nb.add(t2, text="  Map  ")
+        self._map = MapView(t2)
+        self._map.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 3 — Controls
+        t3 = tk.Frame(nb, bg=BG)
+        nb.add(t3, text="  Controls  ")
         self._controls = ControlsPanel(
-            t2,
+            t3,
             on_arm=self._cmd_arm, on_disarm=self._cmd_disarm,
             on_takeoff=self._cmd_takeoff, on_land=self._cmd_land,
             on_rtl=self._cmd_rtl, on_mode=self._cmd_mode,
         )
         self._controls.pack(fill=tk.BOTH, expand=True)
 
-        # Tab 3 Mission
-        t3 = tk.Frame(nb, bg=BG)
-        nb.add(t3, text="  Mission  ")
-        self._mission = MissionPanel(t3)
+        # Tab 4 — Mission
+        t4 = tk.Frame(nb, bg=BG)
+        nb.add(t4, text="  Mission  ")
+        self._mission = MissionPanel(t4)
         self._mission.pack(fill=tk.BOTH, expand=True)
 
-        # Tab 4 Log
-        t4 = tk.Frame(nb, bg=BG)
-        nb.add(t4, text="  Log  ")
-        self._log = LogPanel(t4)
+        # Tab 5 — Alerts
+        t5 = tk.Frame(nb, bg=BG)
+        nb.add(t5, text="  Alerts  ")
+        self._alerts = AlertsPanel(t5, on_alert=self._handle_alert)
+        self._alerts.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 6 — Log
+        t6 = tk.Frame(nb, bg=BG)
+        nb.add(t6, text="  Log  ")
+        self._log = LogPanel(t6)
         self._log.pack(fill=tk.BOTH, expand=True)
         self._log.log("DronePad started.", "OK")
-        self._log.log("Press Simulate to generate synthetic telemetry.", "INFO")
+        self._log.log("Press Simulate to generate synthetic telemetry, or enter a MAVLink connection string.", "INFO")
 
-    def _build_telemetry(self, parent):
+    def _build_telemetry(self, parent: tk.Frame) -> None:
         grid = tk.Frame(parent, bg=BG)
         grid.pack(fill=tk.BOTH, expand=True, padx=16, pady=10)
         for i in range(4):
@@ -131,7 +162,7 @@ class DashboardApp(tk.Frame):
             "roll":    TelemetryCard(grid, "Roll",        "deg"),
             "pitch":   TelemetryCard(grid, "Pitch",       "deg"),
         }
-        positions = [(0,0),(0,1),(0,2),(0,3),(1,0),(1,1),(1,2),(1,3)]
+        positions = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3)]
         for (r, c), card in zip(positions, self._cards.values()):
             card.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
 
@@ -144,29 +175,66 @@ class DashboardApp(tk.Frame):
         tk.Label(gps_row, textvariable=self._gps_var, bg=SURFACE, fg=TEXT,
                  font=("Courier", 10)).pack(side=tk.LEFT, padx=4)
 
-    # connections
-    def _connect(self):
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> None:
         cs = self._conn_entry.get().strip()
-        if not cs: return
-        if self._sim: self._sim.stop(); self._sim = None
+        if not cs:
+            return
+        self._disconnect()
         self._handler = MAVLinkHandler(cs, self._on_telemetry)
         self._handler.connect()
-        self._status_label.config(text="\u25cf  Connecting...", fg=WARN)
-        self._log.log(f"Connecting to {cs}...", "INFO")
+        self._status_label.config(text="\u25cf  Connecting…", fg=WARn if False else "#f59e0b")
+        self._log.log(f"Connecting to {cs}…", "INFO")
 
-    def _start_sim(self):
-        if self._handler: self._handler.disconnect(); self._handler = None
-        if self._sim: self._sim.stop()
+    def _start_sim(self) -> None:
+        self._disconnect()
         self._sim = TelemetrySimulator(self._on_telemetry)
         self._sim.start()
-        self._status_label.config(text="\u25cf  Simulating", fg=WARN)
+        self._status_label.config(text="\u25cf  Simulating", fg=WARn if False else "#f59e0b")
+        self._map.reset()
+        self._history.clear()
         self._log.log("Simulator started — synthetic telemetry at 4 Hz.", "OK")
 
-    # telemetry
-    def _on_telemetry(self, frame: TelemetryFrame):
+    def _disconnect(self) -> None:
+        if self._handler:
+            self._handler.disconnect()
+            self._handler = None
+        if self._sim:
+            self._sim.stop()
+            self._sim = None
+        if self._logger.is_logging:
+            path = self._logger.stop()
+            self._log.log(f"Log saved: {path}", "OK")
+            self._log_indicator.config(text="")
+        self._status_label.config(text="\u25cf  Disconnected", fg=DANGER)
+
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+
+    def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self.after(0, self._update_ui, frame)
 
-    def _update_ui(self, f: TelemetryFrame):
+    def _update_ui(self, f: TelemetryFrame) -> None:
+        # History & logging
+        self._history.push(f)
+        # Auto-start log on arm, auto-stop on disarm
+        if f.armed and not self._was_armed:
+            path = self._logger.start()
+            self._log.log(f"Flight log started: {path}", "OK")
+            self._log_indicator.config(text="● REC", fg=DANGER)
+        elif not f.armed and self._was_armed and self._logger.is_logging:
+            path = self._logger.stop()
+            self._log.log(f"Flight log saved: {path}", "OK")
+            self._log_indicator.config(text="")
+        self._was_armed = f.armed
+        if self._logger.is_logging:
+            self._logger.write(f)
+
+        # Cards
         self._cards["alt"].update_value(f"{f.rel_alt:.1f}")
         self._cards["speed"].update_value(f"{f.groundspeed:.1f}")
         self._cards["batt"].update_value(str(f.battery_pct))
@@ -180,29 +248,52 @@ class DashboardApp(tk.Frame):
                                   fg=DANGER if f.armed else SUCCESS)
         if self._handler and self._handler.connected:
             self._status_label.config(text="\u25cf  Connected", fg=SUCCESS)
+
+        # Map
+        self._map.update_frame(f)
+
+        # Alerts
+        self._alerts.check_frame(f)
+
+        # Controls state
         self._controls.set_armed_state(f.armed)
 
-    # commands
-    def _cmd_arm(self):
-        if self._sim: self._sim.arm()
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+
+    def _cmd_arm(self) -> None:
+        if self._sim:
+            self._sim.arm()
+        elif self._handler:
+            pass  # send MAVLink arm command
         self._log.log("ARM command sent.", "WARN")
 
-    def _cmd_disarm(self):
-        if self._sim: self._sim.disarm()
+    def _cmd_disarm(self) -> None:
+        if self._sim:
+            self._sim.disarm()
         self._log.log("DISARM command sent.", "INFO")
 
-    def _cmd_takeoff(self, alt: float):
-        if self._sim: self._sim.arm()
-        self._log.log(f"TAKEOFF to {alt:.0f}m requested.", "INFO")
+    def _cmd_takeoff(self, alt: float) -> None:
+        if self._sim:
+            self._sim.arm()
+        self._log.log(f"TAKEOFF to {alt:.0f} m requested.", "INFO")
 
-    def _cmd_land(self):
-        if self._sim: self._sim.set_mode("LAND")
+    def _cmd_land(self) -> None:
+        if self._sim:
+            self._sim.set_mode("LAND")
         self._log.log("LAND command sent.", "WARN")
 
-    def _cmd_rtl(self):
-        if self._sim: self._sim.set_mode("RTL")
+    def _cmd_rtl(self) -> None:
+        if self._sim:
+            self._sim.set_mode("RTL")
         self._log.log("RTL command sent.", "WARN")
 
-    def _cmd_mode(self, mode: str):
-        if self._sim: self._sim.set_mode(mode)
+    def _cmd_mode(self, mode: str) -> None:
+        if self._sim:
+            self._sim.set_mode(mode)
         self._log.log(f"Mode \u2192 {mode}", "INFO")
+
+    def _handle_alert(self, level: str, msg: str) -> None:
+        lvl_map = {"CRITICAL": "ERROR", "WARN": "WARN"}
+        self._log.log(f"[ALERT] {msg}", lvl_map.get(level, "WARN"))  # type: ignore

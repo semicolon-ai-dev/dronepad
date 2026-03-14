@@ -1,1 +1,4 @@
-pymavlink>=2.4.0
+pymavlink>=2.4.37
+pillow>=10.0
+matplotlib>=3.8
+pandas>=2.0
